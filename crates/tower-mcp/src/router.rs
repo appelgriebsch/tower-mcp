@@ -195,6 +195,15 @@ struct McpRouterInner {
     /// When set, the value is returned as `ttlMs` in tools/list, resources/list,
     /// and prompts/list responses so clients can cache the list.
     list_ttl_ms: Option<u64>,
+    /// Default TTL hint for resources/read responses in milliseconds
+    /// (SEP-2549). Applied only when the resource handler did not set its
+    /// own `ttl_ms` on the result.
+    read_ttl_ms: Option<u64>,
+    /// Cache scope for SEP-2549 hints on list and read responses. When a
+    /// TTL is emitted and no scope is configured, `private` is used: it is
+    /// the conservative choice (never shared across authorization
+    /// contexts).
+    cache_scope: Option<CacheScope>,
     /// Deprecation info for the logging capability (SEP-2577).
     /// When set, included in the `logging` capability in the initialize result.
     logging_deprecated: Option<tower_mcp_types::protocol::DeprecationInfo>,
@@ -331,6 +340,8 @@ impl McpRouter {
                 min_log_level: Arc::new(RwLock::new(LogLevel::Debug)),
                 page_size: None,
                 list_ttl_ms: None,
+                read_ttl_ms: None,
+                cache_scope: None,
                 logging_deprecated: None,
                 disabled_tools: Arc::new(RwLock::new(HashSet::new())),
                 disabled_resources: Arc::new(RwLock::new(HashSet::new())),
@@ -541,6 +552,19 @@ impl McpRouter {
         let inner_dyn = Arc::new(DynamicResourceTemplatesInner::new());
         Arc::make_mut(&mut self.inner).dynamic_resource_templates = Some(inner_dyn.clone());
         (self, DynamicResourceTemplateRegistry::new(inner_dyn))
+    }
+
+    /// Set the notification sender without registering it with the shared
+    /// dynamic registries.
+    ///
+    /// Used by transports for per-request (sessionless) notification
+    /// capture: the dynamic registries are long-lived and shared across
+    /// router clones, so registering one sender per request would
+    /// accumulate senders without bound.
+    #[cfg(feature = "stateless")]
+    pub(crate) fn with_request_notification_sender(mut self, tx: NotificationSender) -> Self {
+        Arc::make_mut(&mut self.inner).notification_tx = Some(tx);
+        self
     }
 
     /// Set the notification sender for progress reporting
@@ -762,6 +786,30 @@ impl McpRouter {
         self
     }
 
+    /// Set a default TTL hint on resources/read responses (SEP-2549).
+    ///
+    /// Applied only when the resource handler did not set its own `ttl_ms`
+    /// on the [`ReadResourceResult`]. When any TTL is emitted without a
+    /// configured [`cache_scope`](Self::cache_scope), the scope defaults to
+    /// `private`.
+    pub fn read_ttl(mut self, ms: u64) -> Self {
+        Arc::make_mut(&mut self.inner).read_ttl_ms = Some(ms);
+        self
+    }
+
+    /// Set the SEP-2549 cache scope emitted alongside TTL hints on list and
+    /// resources/read responses.
+    ///
+    /// `CacheScope::Public` allows any client, gateway, or proxy to reuse
+    /// the cached result across authorization contexts; `CacheScope::Private`
+    /// restricts reuse to the same authorization context. When a TTL is
+    /// emitted and no scope is configured, `private` is used as the
+    /// conservative default.
+    pub fn cache_scope(mut self, scope: CacheScope) -> Self {
+        Arc::make_mut(&mut self.inner).cache_scope = Some(scope);
+        self
+    }
+
     /// Mark the logging capability as deprecated in the server's initialize result.
     ///
     /// When set, the `deprecated` object is included in the `logging` capability
@@ -966,6 +1014,7 @@ impl McpRouter {
     ///                 meta: None,
     ///             }],
     ///             meta: None,
+    ///             ..Default::default()
     ///         })
     ///     });
     ///
@@ -1729,6 +1778,32 @@ impl McpRouter {
         }
     }
 
+    /// Effective SEP-2549 cache scope to emit alongside a TTL hint.
+    ///
+    /// Returns the configured scope, or `private` (the conservative choice)
+    /// when a TTL is being emitted without an explicit scope. Returns `None`
+    /// when no TTL is emitted and no scope is configured, so responses
+    /// without hints stay hint-free.
+    fn effective_cache_scope(&self, ttl_ms: Option<u64>) -> Option<CacheScope> {
+        self.inner
+            .cache_scope
+            .or_else(|| ttl_ms.map(|_| CacheScope::Private))
+    }
+
+    /// Fill in SEP-2549 caching hints on a resources/read result.
+    ///
+    /// Handler-set values win; the router-level `read_ttl` and `cache_scope`
+    /// configuration only fills fields the handler left unset.
+    fn apply_read_cache_hints(&self, mut result: ReadResourceResult) -> ReadResourceResult {
+        if result.ttl_ms.is_none() {
+            result.ttl_ms = self.inner.read_ttl_ms;
+        }
+        if result.cache_scope.is_none() {
+            result.cache_scope = self.effective_cache_scope(result.ttl_ms);
+        }
+        result
+    }
+
     /// Handle an MCP request
     async fn handle(
         &self,
@@ -1864,7 +1939,7 @@ impl McpRouter {
                     tools,
                     next_cursor,
                     ttl_ms: self.inner.list_ttl_ms,
-                    cache_scope: None,
+                    cache_scope: self.effective_cache_scope(self.inner.list_ttl_ms),
                     meta: None,
                 }))
             }
@@ -2098,7 +2173,7 @@ impl McpRouter {
                     resources,
                     next_cursor,
                     ttl_ms: self.inner.list_ttl_ms,
-                    cache_scope: None,
+                    cache_scope: self.effective_cache_scope(self.inner.list_ttl_ms),
                     meta: None,
                 }))
             }
@@ -2138,7 +2213,7 @@ impl McpRouter {
                         resource_templates,
                         next_cursor,
                         ttl_ms: self.inner.list_ttl_ms,
-                        cache_scope: None,
+                        cache_scope: self.effective_cache_scope(self.inner.list_ttl_ms),
                         meta: None,
                     },
                 ))
@@ -2170,7 +2245,9 @@ impl McpRouter {
                     tracing::debug!(uri = %params.uri, "Reading static resource");
                     let ctx = self.create_context_with_extensions(request_id, None, &extensions);
                     let result = resource.read_with_context(ctx).await;
-                    return Ok(McpResponse::ReadResource(result));
+                    return Ok(McpResponse::ReadResource(
+                        self.apply_read_cache_hints(result),
+                    ));
                 }
 
                 // Try dynamic resources
@@ -2187,7 +2264,9 @@ impl McpRouter {
                         let ctx =
                             self.create_context_with_extensions(request_id, None, &extensions);
                         let result = resource.read_with_context(ctx).await;
-                        return Ok(McpResponse::ReadResource(result));
+                        return Ok(McpResponse::ReadResource(
+                            self.apply_read_cache_hints(result),
+                        ));
                     }
                 }
 
@@ -2200,7 +2279,9 @@ impl McpRouter {
                             "Reading resource via template"
                         );
                         let result = template.read(&params.uri, variables).await?;
-                        return Ok(McpResponse::ReadResource(result));
+                        return Ok(McpResponse::ReadResource(
+                            self.apply_read_cache_hints(result),
+                        ));
                     }
                 }
 
@@ -2215,7 +2296,9 @@ impl McpRouter {
                             "Reading resource via dynamic template"
                         );
                         let result = template.read(&params.uri, variables).await?;
-                        return Ok(McpResponse::ReadResource(result));
+                        return Ok(McpResponse::ReadResource(
+                            self.apply_read_cache_hints(result),
+                        ));
                     }
                 }
 
@@ -2294,7 +2377,7 @@ impl McpRouter {
                     prompts,
                     next_cursor,
                     ttl_ms: self.inner.list_ttl_ms,
-                    cache_scope: None,
+                    cache_scope: self.effective_cache_scope(self.inner.list_ttl_ms),
                     meta: None,
                 }))
             }
@@ -3198,6 +3281,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -3242,6 +3326,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -3290,6 +3375,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -3346,6 +3432,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
@@ -3391,6 +3478,7 @@ mod tests {
                         meta: None,
                     }],
                     meta: None,
+                    ..Default::default()
                 })
             });
 
