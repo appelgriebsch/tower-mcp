@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.21.0] - 2026-08-07
+
+### Bug Fixes
+
+- Re-export notification_channel from the crate root ([#1241](https://github.com/joshrotenberg/tower-mcp/pull/1241))
+
+### Documentation
+
+- Correct three claims that contradict the code ([#1235](https://github.com/joshrotenberg/tower-mcp/pull/1235))
+
+### Features
+
+- **router:** Add opt-in panic containment for tool handlers ([#1236](https://github.com/joshrotenberg/tower-mcp/pull/1236))
+- **stdio:** Handle requests concurrently ([#1238](https://github.com/joshrotenberg/tower-mcp/pull/1238))
+
+  Requests on a stdio connection now run on their own tasks, so a slow tool
+  no longer blocks the rest of the connection. Responses consequently arrive
+  in completion order rather than request order. JSON-RPC pairs a response to
+  its request by id, so this is within spec, but code that assumed responses
+  came back positionally needs to match by id. `StdioTransport::max_concurrent_requests(1)`
+  restores the previous strictly serial handling.
+- **router:** Add try_merge and conflicts for router composition ([#1239](https://github.com/joshrotenberg/tower-mcp/pull/1239))
+
+
+
 ## [0.20.1] - 2026-08-05
 
 ### Features
