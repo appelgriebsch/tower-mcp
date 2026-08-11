@@ -2712,13 +2712,55 @@ impl McpRouter {
             return;
         }
 
-        if let Err(e) = self
+        // A park that does not take leaves the task working with nothing
+        // outstanding, which no `tasks/update` can ever move. Failing it says
+        // why instead of stranding it, matching the empty-request case above
+        // (#1246).
+        match self
             .inner
             .task_store
             .require_input(task_id, requests, input_required.request_state.as_deref())
             .await
         {
-            tracing::warn!(task_id = %task_id, error = %e, "failed to park task for input");
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(
+                    task_id = %task_id,
+                    "task was already terminal or gone when parking for input"
+                );
+            }
+            Err(e) => {
+                // Either way the park is lost and the task can never be
+                // answered, so both end it. They are not the same fault
+                // though: an invalid transition is the handler asking for
+                // something the protocol forbids, which no retry fixes,
+                // while a backend failure is infrastructure (#1246).
+                let error = match &e {
+                    crate::async_task::TaskStoreError::InvalidTransition(message) => {
+                        tracing::error!(
+                            task_id = %task_id,
+                            error = %message,
+                            "handler asked for input the protocol does not allow"
+                        );
+                        JsonRpcError::internal_error(format!(
+                            "handler asked for input the protocol does not allow: {message}"
+                        ))
+                    }
+                    other => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %other,
+                            "task store could not park the task for input"
+                        );
+                        JsonRpcError::internal_error(format!(
+                            "could not park the task for input: {other}"
+                        ))
+                    }
+                };
+                if let Err(e) = self.inner.task_store.fail_task(task_id, error).await {
+                    tracing::warn!(task_id = %task_id, error = %e, "failed to record task failure");
+                }
+            }
         }
         self.notify_task_state(task_id).await;
     }
@@ -6519,6 +6561,125 @@ mod tests {
             "the failure must name what to implement"
         );
     }
+    /// #1246 point 5: a handler that reuses a spent key is asking for
+    /// something SEP-2663 forbids the server to send. The park is refused,
+    /// and the task must say so rather than sit in `working` with nothing
+    /// outstanding, which no `tasks/update` could ever move.
+    #[cfg(feature = "stateless")]
+    #[tokio::test]
+    async fn reusing_a_spent_input_key_fails_the_task_instead_of_stranding_it() {
+        use crate::async_task::{MemoryTaskStore, TaskStore};
+        use crate::protocol::{
+            ElicitFormParams, ElicitFormSchema, ElicitRequestParams, InputRequest, InputRequests,
+            InputRequiredResult, RequestOutcome,
+        };
+
+        fn ask(key: &str) -> InputRequests {
+            let mut requests: InputRequests = Default::default();
+            requests.insert(
+                key.to_string(),
+                InputRequest::Elicit(ElicitRequestParams::Form(ElicitFormParams {
+                    mode: None,
+                    message: "approve?".to_string(),
+                    requested_schema: ElicitFormSchema::new(),
+                    meta: None,
+                })),
+            );
+            requests
+        }
+
+        // Always asks for "decision", even after it has been answered.
+        let repeats = ToolBuilder::new("repeats")
+            .description("Reuses a spent key")
+            .task_support(TaskSupportMode::Optional)
+            .mrtr_handler::<serde_json::Value, _, _>(|_ctx, _input| async move {
+                Ok(RequestOutcome::input_required(
+                    InputRequiredResult::with_requests(ask("decision")),
+                ))
+            })
+            .build();
+
+        let store = std::sync::Arc::new(MemoryTaskStore::new());
+        let mut router = McpRouter::new()
+            .task_store(store.clone())
+            .tool(repeats)
+            .with_tasks();
+        init_router(&mut router).await;
+
+        let resp = router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(1),
+                inner: McpRequest::CallTool(CallToolParams {
+                    input_responses: None,
+                    request_state: None,
+                    name: "repeats".to_string(),
+                    arguments: serde_json::json!({}),
+                    meta: None,
+                    task: None,
+                }),
+                extensions: tasks_client_extensions(),
+            })
+            .await
+            .unwrap();
+        let task_id = match resp.inner {
+            Ok(McpResponse::FinalCreateTask(result)) => result.task.metadata.task_id,
+            other => panic!("expected a created task, got {other:?}"),
+        };
+
+        // First park is legitimate.
+        let mut parked = false;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if store.get_task(&task_id).await.unwrap().unwrap().status == TaskStatus::InputRequired
+            {
+                parked = true;
+                break;
+            }
+        }
+        assert!(parked, "the task must reach input_required");
+
+        // Answering resumes the handler, which asks for the same key again.
+        router
+            .ready()
+            .await
+            .unwrap()
+            .call(RouterRequest {
+                id: RequestId::Number(2),
+                inner: McpRequest::UpdateTask(UpdateTaskParams {
+                    task_id: task_id.clone(),
+                    input_responses: [(
+                        "decision".to_string(),
+                        serde_json::json!({"action": "accept"}),
+                    )]
+                    .into_iter()
+                    .collect(),
+                    meta: None,
+                }),
+                extensions: tasks_client_extensions(),
+            })
+            .await
+            .unwrap();
+
+        let mut failed = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let (task, _, error) = store.get_task_result(&task_id).await.unwrap().unwrap();
+            if task.status == TaskStatus::Failed {
+                failed = error;
+                break;
+            }
+        }
+        let error = failed.expect("the task must fail rather than strand");
+        assert!(
+            error.message.contains("decision"),
+            "the failure must name the offending key: {}",
+            error.message
+        );
+    }
+
     /// #1246 point 1: `tasks/update` resumes whenever nothing is
     /// outstanding, without checking that an `input_required -> working`
     /// transition actually happened. A stray update while the first handler
