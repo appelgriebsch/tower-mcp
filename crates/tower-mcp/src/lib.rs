@@ -615,7 +615,9 @@ pub use middleware::{
 pub use mrtr::{MrtrRequest, RequestStateCodec, RequestStateError};
 #[cfg(feature = "stateless")]
 pub use prompt::MrtrPromptHandler;
-pub use prompt::{BoxPromptService, Prompt, PromptBuilder, PromptHandler, PromptRequest};
+pub use prompt::{
+    BoxPromptService, McpPrompt, Prompt, PromptBuilder, PromptHandler, PromptRequest,
+};
 #[allow(deprecated)]
 pub use protocol::{
     BooleanSchema, CallToolParams, CallToolResult, CancelTaskParams, CancelledParams,
@@ -660,7 +662,7 @@ pub use registry::{
     DynamicToolRegistry,
 };
 pub use resource::{
-    BoxResourceService, Resource, ResourceBuilder, ResourceHandler, ResourceRequest,
+    BoxResourceService, McpResource, Resource, ResourceBuilder, ResourceHandler, ResourceRequest,
     ResourceTemplate, ResourceTemplateBuilder, ResourceTemplateHandler,
 };
 #[cfg(feature = "stateless")]
@@ -673,7 +675,7 @@ pub use session::{SessionPhase, SessionState};
 #[cfg(feature = "stateless")]
 pub use tool::MrtrToolHandler;
 pub use tool::{
-    BoxToolService, GuardLayer, NoParams, TaskContext, TaskPreparation, Tool, ToolBuilder,
+    BoxToolService, GuardLayer, McpTool, NoParams, TaskContext, TaskPreparation, Tool, ToolBuilder,
     ToolHandler, ToolRequest,
 };
 pub use transport::{

@@ -1674,9 +1674,7 @@ where
 /// # Example
 ///
 /// ```rust
-/// use tower_mcp::resource::McpResource;
-/// use tower_mcp::protocol::{ReadResourceResult, ResourceContent};
-/// use tower_mcp::error::Result;
+/// use tower_mcp::{McpResource, ReadResourceResult, ResourceContent, Result};
 ///
 /// struct ConfigResource {
 ///     config: String,
