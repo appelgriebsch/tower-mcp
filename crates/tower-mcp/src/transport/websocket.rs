@@ -68,6 +68,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 
 use axum::{
@@ -471,8 +472,54 @@ impl WebSocketTransport {
         router
     }
 
-    /// Serve the transport on the given address
+    /// Serve the transport on the given address, forever.
+    ///
+    /// This future never resolves on its own. Use
+    /// [`serve_with_shutdown`](Self::serve_with_shutdown) in any process that
+    /// has to stop the server without exiting.
     pub async fn serve(self, addr: &str) -> Result<()> {
+        self.serve_with_shutdown(addr, std::future::pending::<()>())
+            .await
+    }
+
+    /// Serve the transport on the given address until `signal` resolves.
+    ///
+    /// The signal has the same shape as
+    /// `axum::serve(..).with_graceful_shutdown(..)`, because that is what it
+    /// drives: once it resolves the listener stops accepting and this future
+    /// returns. Binding still happens up front, so a bind error is reported
+    /// before the signal is ever awaited.
+    ///
+    /// # Open sockets are not part of the shutdown
+    ///
+    /// This transport has no equivalent of
+    /// [`HttpTransport::drain_timeout`](crate::HttpTransport::drain_timeout),
+    /// because there is nothing here for a bound to cut short. A WebSocket
+    /// leaves the connection axum is tracking the moment it is upgraded, and
+    /// runs from then on in a task of its own. Shutting down therefore
+    /// neither waits for open sockets nor closes them: it stops new clients
+    /// getting in and hands control back, and the sockets already up live
+    /// until their clients hang up or the process exits.
+    ///
+    /// A server that has to close them itself should keep its own record of
+    /// live connections, as it would for any other broadcast.
+    ///
+    /// ```rust,no_run
+    /// use tower_mcp::{McpRouter, WebSocketTransport};
+    ///
+    /// # async fn example() -> Result<(), tower_mcp::BoxError> {
+    /// WebSocketTransport::new(McpRouter::new())
+    ///     .serve_with_shutdown("127.0.0.1:3000", async {
+    ///         tokio::signal::ctrl_c().await.ok();
+    ///     })
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn serve_with_shutdown<F>(self, addr: &str, signal: F) -> Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         let listener = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| Error::Transport(format!("Failed to bind to {}: {}", addr, e)))?;
@@ -480,11 +527,7 @@ impl WebSocketTransport {
         tracing::info!("MCP WebSocket transport listening on {}", addr);
 
         let router = self.into_router();
-        axum::serve(listener, router)
-            .await
-            .map_err(|e| Error::Transport(format!("Server error: {}", e)))?;
-
-        Ok(())
+        crate::transport::graceful::serve_with_shutdown(listener, router, signal, None).await
     }
 }
 
