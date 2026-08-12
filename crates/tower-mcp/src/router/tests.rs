@@ -3572,6 +3572,200 @@ fn declining_subscriptions_does_not_invent_a_resources_capability() {
     assert!(router.capabilities().resources.is_none());
 }
 
+/// Build a router with a tool, a resource, and a prompt registered, and
+/// optionally a notification channel attached. Used to pin the pre-#1338
+/// capability advertisement across every configuration that exists today.
+fn router_with_all_capabilities(with_notifications: bool) -> McpRouter {
+    let tool = ToolBuilder::new("test")
+        .description("test")
+        .handler(|_input: AddInput| async { Ok(CallToolResult::text("ok")) })
+        .build();
+
+    let mut router = McpRouter::new()
+        .server_info("defaults", "1.0")
+        .tool(tool)
+        .resource(
+            crate::resource::ResourceBuilder::new("mem://one")
+                .name("one")
+                .text("hi"),
+        )
+        .prompt(crate::prompt::PromptBuilder::new("greeting").user_message("hi"));
+
+    if with_notifications {
+        let (tx, _rx) = crate::context::notification_channel(16);
+        router = router.with_notification_sender(tx);
+    }
+
+    router
+}
+
+/// Regression test for #1338: before per-capability builders existed, all of
+/// `tools.listChanged`, `prompts.listChanged`, `resources.listChanged`, and
+/// `logging` were derived solely from whether a notification channel was
+/// attached. This pins that exact behavior, in every configuration that
+/// exists today, as a guard against the new builders' defaults drifting from
+/// it.
+#[test]
+fn capability_defaults_are_unchanged_by_per_capability_builders() {
+    // No notifications, nothing registered: no capability advertised at all.
+    let empty_router = McpRouter::new().server_info("empty", "1.0");
+    let empty_caps = empty_router.capabilities();
+    assert!(empty_caps.tools.is_none());
+    assert!(empty_caps.resources.is_none());
+    assert!(empty_caps.prompts.is_none());
+    assert!(empty_caps.logging.is_none());
+
+    // Notifications attached, nothing registered: only logging is advertised,
+    // since tools/resources/prompts capabilities are only present when the
+    // corresponding items are registered.
+    let (tx, _rx) = crate::context::notification_channel(16);
+    let empty_with_notifications = McpRouter::new()
+        .server_info("empty-notified", "1.0")
+        .with_notification_sender(tx);
+    let empty_notified_caps = empty_with_notifications.capabilities();
+    assert!(empty_notified_caps.tools.is_none());
+    assert!(empty_notified_caps.resources.is_none());
+    assert!(empty_notified_caps.prompts.is_none());
+    assert!(empty_notified_caps.logging.is_some());
+
+    // Everything registered, no notification channel: every capability is
+    // advertised, but every `list_changed` flag is false, and there is no
+    // logging capability.
+    let no_notifications = router_with_all_capabilities(false);
+    let no_notif_caps = no_notifications.capabilities();
+    let tools_cap = no_notif_caps.tools.expect("tool registered");
+    assert!(!tools_cap.list_changed);
+    let resources_cap = no_notif_caps.resources.expect("resource registered");
+    assert!(!resources_cap.list_changed);
+    assert!(resources_cap.subscribe, "subscribe still defaults to true");
+    let prompts_cap = no_notif_caps.prompts.expect("prompt registered");
+    assert!(!prompts_cap.list_changed);
+    assert!(no_notif_caps.logging.is_none());
+
+    // Everything registered, notification channel attached: every capability
+    // is advertised and every `list_changed` flag, plus logging, is true.
+    let with_notifications = router_with_all_capabilities(true);
+    let notif_caps = with_notifications.capabilities();
+    let tools_cap = notif_caps.tools.expect("tool registered");
+    assert!(tools_cap.list_changed);
+    let resources_cap = notif_caps.resources.expect("resource registered");
+    assert!(resources_cap.list_changed);
+    assert!(resources_cap.subscribe);
+    let prompts_cap = notif_caps.prompts.expect("prompt registered");
+    assert!(prompts_cap.list_changed);
+    assert!(notif_caps.logging.is_some());
+}
+
+/// #1338: `tools_list_changed` overrides the notification-channel default in
+/// either direction, whether or not a channel is attached.
+#[test]
+fn tools_list_changed_overrides_the_notification_channel_default() {
+    for with_channel in [false, true] {
+        for advertise in [true, false] {
+            let router = router_with_all_capabilities(with_channel).tools_list_changed(advertise);
+            let tools_cap = router.capabilities().tools.expect("tool registered");
+            assert_eq!(
+                tools_cap.list_changed, advertise,
+                "with_channel={with_channel} advertise={advertise}"
+            );
+        }
+    }
+}
+
+/// #1338: `prompts_list_changed` overrides the notification-channel default
+/// in either direction, whether or not a channel is attached.
+#[test]
+fn prompts_list_changed_overrides_the_notification_channel_default() {
+    for with_channel in [false, true] {
+        for advertise in [true, false] {
+            let router = router_with_all_capabilities(with_channel).prompts_list_changed(advertise);
+            let prompts_cap = router.capabilities().prompts.expect("prompt registered");
+            assert_eq!(
+                prompts_cap.list_changed, advertise,
+                "with_channel={with_channel} advertise={advertise}"
+            );
+        }
+    }
+}
+
+/// #1338: `resources_list_changed` overrides the notification-channel
+/// default in either direction, whether or not a channel is attached, and is
+/// independent of `resource_subscriptions`.
+#[test]
+fn resources_list_changed_overrides_the_notification_channel_default() {
+    for with_channel in [false, true] {
+        for advertise in [true, false] {
+            let router =
+                router_with_all_capabilities(with_channel).resources_list_changed(advertise);
+            let resources_cap = router
+                .capabilities()
+                .resources
+                .expect("resource registered");
+            assert_eq!(
+                resources_cap.list_changed, advertise,
+                "with_channel={with_channel} advertise={advertise}"
+            );
+            // Independent of resources.listChanged: subscribe keeps its own
+            // default regardless of this setting.
+            assert!(resources_cap.subscribe);
+        }
+    }
+}
+
+/// #1338: `mcp_logging` overrides the notification-channel default in either
+/// direction, whether or not a channel is attached.
+#[test]
+fn mcp_logging_overrides_the_notification_channel_default() {
+    for with_channel in [false, true] {
+        for advertise in [true, false] {
+            let router = router_with_all_capabilities(with_channel).mcp_logging(advertise);
+            assert_eq!(
+                router.capabilities().logging.is_some(),
+                advertise,
+                "with_channel={with_channel} advertise={advertise}"
+            );
+        }
+    }
+}
+
+/// #1338: the four per-capability builders and
+/// `StdioTransport::without_server_notifications` (#1257) compose sensibly.
+///
+/// `without_server_notifications` never attaches a notification channel to
+/// the router, so on the router side its effect is identical to simply not
+/// calling `with_notification_sender`. A server built on top of it still
+/// gets the same all-or-nothing default (nothing advertised), but an
+/// explicit per-capability override still wins, exactly as it does with a
+/// channel attached. The all-or-nothing switch is the default; the builders
+/// are the refinement underneath it, not something it disables.
+#[test]
+fn without_server_notifications_composes_with_explicit_overrides() {
+    // No notification channel attached (what `without_server_notifications`
+    // produces on the router): every flag defaults to false, matching the
+    // "nothing advertised" behavior of the all-or-nothing switch.
+    let router = router_with_all_capabilities(false);
+    let caps = router.capabilities();
+    assert!(!caps.tools.expect("tool registered").list_changed);
+    assert!(!caps.prompts.expect("prompt registered").list_changed);
+    assert!(!caps.resources.expect("resource registered").list_changed);
+    assert!(caps.logging.is_none());
+
+    // An explicit override still wins even though no channel is attached:
+    // the flag is advertised, even though nothing will ever be sent over a
+    // channel that does not exist. That is the caller's responsibility once
+    // they have opted in explicitly.
+    let router = router_with_all_capabilities(false)
+        .tools_list_changed(true)
+        .prompts_list_changed(true)
+        .resources_list_changed(true)
+        .mcp_logging(true);
+    let caps = router.capabilities();
+    assert!(caps.tools.expect("tool registered").list_changed);
+    assert!(caps.prompts.expect("prompt registered").list_changed);
+    assert!(caps.resources.expect("resource registered").list_changed);
+    assert!(caps.logging.is_some());
+}
+
 #[tokio::test]
 async fn test_completion_handler() {
     let router = McpRouter::new()
