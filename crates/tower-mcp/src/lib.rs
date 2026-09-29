@@ -168,6 +168,10 @@
 //! - `macros` - Optional proc macros (`#[tool_fn]`, `#[prompt_fn]`, `#[resource_fn]`, `#[resource_template_fn]`)
 //! - `mcp-apps` - Typed server support for the stable MCP Apps extension. Runtime
 //!   advertisement remains explicit through [`McpRouter::with_mcp_apps`].
+//! - `schema-validation` - Validate tool arguments against `inputSchema` and
+//!   `structuredContent` against `outputSchema` at call time, on by default for every
+//!   tool once compiled (opt out per tool with `ToolBuilder::skip_input_validation` and
+//!   `ToolBuilder::skip_output_validation`). See [`guides::schema_validation`].
 //! - `protocol-2026-07-28` - Compile the released 2026-07-28 implementation.
 //!   Use [`ProtocolSupport`] to select enabled versions at runtime. Enables
 //!   version-gated sessionless dispatch, `server/discover` RPC, per-request `_meta` via
@@ -181,16 +185,19 @@
 //!
 //! ## Task-oriented Guides
 //!
-//! - [`guides::client`] —
+//! - [`guides::client`]:
 //!   transport selection, lifecycle, callbacks, requests, caching, retries, and shutdown.
-//! - [`guides::deployment`] —
+//! - [`guides::deployment`]:
 //!   mounting, reverse proxies, origin/host validation, sessions, scaling, timeouts,
 //!   middleware order, health, and graceful shutdown.
-//! - [`guides::protocol_versions`] —
+//! - [`guides::protocol_versions`]:
 //!   compile-time availability, runtime allowlists, lifecycle differences,
 //!   interoperability, and upgrades.
-//! - [`guides`] — OAuth, MCP Apps, and the complete task-oriented guide index.
-//! - [Examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md) —
+//! - [`guides::schema_validation`]:
+//!   validating tool arguments and structured output, deriving output schemas,
+//!   the error format, and opting out (requires `schema-validation`).
+//! - [`guides`]: OAuth, MCP Apps, and the complete task-oriented guide index.
+//! - [Examples index](https://github.com/joshrotenberg/tower-mcp/blob/main/examples/README.md):
 //!   runnable server, client, transport, middleware, OAuth, and extension patterns.
 //!
 //! ## Module Overviews
